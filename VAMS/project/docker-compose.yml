@@ -1,0 +1,108 @@
+services:
+  scylladb:
+    image: scylladb/scylla:latest
+    container_name: scylla-db
+    ports:
+      - "9042:9042"
+    volumes:
+      - ./VAMS-Backend/src/main/resources/schema.cql:/docker-entrypoint-initdb.d/schema.cql
+      - ./VAMS-Backend/init-schema.sh:/init-schema.sh
+      - scylla_data:/var/lib/scylla
+    entrypoint: ["/init-schema.sh"]
+    environment:
+      - SCYLLA_ENABLE_EXPERIMENTAL=${SCYLLA_ENABLE_EXPERIMENTAL}
+    healthcheck:
+      test: [ "CMD", "cqlsh", "-e", "DESCRIBE KEYSPACES" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    depends_on:
+      scylladb:
+        condition: service_healthy
+    build: ./VAMS-Backend/
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_APPLICATION_JSON: '{
+              "spring.cassandra.keyspacename": "${CASSANDRA_KEYSPACE}",
+              "spring.cassandra.contact-points": "${CASSANDRA_CONTACT_POINTS}",
+              "spring.cassandra.port": "${CASSANDRA_PORT}",
+              "spring.cassandra.username": "${CASSANDRA_USERNAME}",
+              "spring.cassandra.password": "${CASSANDRA_PASSWORD}",
+              "spring.cassandra.schema-action": "${CASSANDRA_SCHEMA_ACTION}",
+              "spring.cassandra.local-datacenter": "${CASSANDRA_LOCAL_DC}",
+              "spring.cassandra.connection.connect-timeout": "${CASSANDRA_CONNECT_TIMEOUT}",
+              "port" : "8080",
+              "spring.kafka.consumer.bootstrap-servers": "kafka:9092",
+              "spring.kafka.producer.bootstrap-servers": "kafka:9092"
+            }'
+  frontend:
+    depends_on:
+      - api
+    build: ./VAMS-Frontend/
+    container_name: react-frontend
+    ports:
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+    # volumes:
+    #   - "./VAMS-Frontend:/app"
+
+  proxy:
+    depends_on:
+      - api
+      - frontend
+    image: nginx:1.27-alpine
+    volumes:
+      - "./nginx.conf:/etc/nginx/nginx.conf:ro"
+    ports:
+      - "${PROXY_PORT}:80"
+
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.4
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "22181:2181"
+  
+  kafka:
+    image: confluentinc/cp-kafka:7.4.4
+    depends_on:
+      - zookeeper
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_MS: 10000
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 5000
+    healthcheck:
+      test: kafka-topics --bootstrap-server kafka:9092 --list
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  generator:
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    build: ./Generators/volcano-info-gen/
+    container_name: volcano_info_generator
+    environment:
+        KAFKA_BROKER: "kafka:9092"
+        PYTHONUNBUFFERED: 1       # enable python to print
+
+# remove volume: docker volume rm scylla_data
+volumes:
+  scylla_data:
+    driver: local
